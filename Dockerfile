@@ -27,6 +27,9 @@ WORKDIR /root/
 # Copy the binary from builder
 COPY --from=builder /app/cli-static-web .
 
+# Copy the build folder from builder (React/static assets)
+COPY --from=builder /app/build ./build
+
 RUN chmod +x cli-static-web
 
 # Make it executable
