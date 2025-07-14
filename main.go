@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/joho/godotenv"
 
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
@@ -25,7 +26,53 @@ import (
 )
 
 func main() {
-	bucketName := "myblog.lawangin.io"
+	if os.Getenv("AWS_REGION") == "" {
+		err := godotenv.Load() // fallback for local .env
+		if err != nil {
+			log.Fatalf("Error loading .env file: %v", err)
+		}
+
+	}
+
+	awsRegion := os.Getenv("AWS_REGION")
+	sslCertARN := os.Getenv("SSL_CERT_ARN")
+	if awsRegion == "" || sslCertARN == "" {
+		log.Fatalf("Missing required environment variables: AWS_REGION or SSL_CERT_ARN")
+	}
+
+	var projectName string
+	fmt.Print("Enter project name (e.g., myblog): ")
+	_, err := fmt.Scanln(&projectName)
+	if err != nil {
+		log.Fatalf("project name not valid, %v", err)
+	}
+
+	var domain string
+	fmt.Print("Enter domain name (e.g., mywebsite.com): ")
+	_, err = fmt.Scanln(&domain)
+	if err != nil {
+		log.Fatalf("project name not valid, %v", err)
+	}
+
+	bucketName := fmt.Sprintf("%s.%s", projectName, domain)
+
+	var folderPath string
+	fmt.Print("Enter local path to build folder (e.g., ./build): ")
+	_, err = fmt.Scanln(&folderPath)
+	if err != nil {
+		log.Fatalf("local path not valid, %v", err)
+	}
+
+	const maxUploadSizeBytes = 50 * 1024 * 1024 // 50 MB
+
+	size, err := folderSize(folderPath)
+	if err != nil {
+		log.Fatalf("Failed to check folder size: %v", err)
+	}
+	if size > maxUploadSizeBytes {
+		log.Fatalf("Build folder exceeds max allowed size (%.2f MB)", float64(size)/1024.0/1024.0)
+	}
+
 	ctx := context.TODO()
 
 	s3Created := false
@@ -34,7 +81,7 @@ func main() {
 
 	// Load the Shared AWS Configuration (~/.aws/config)
 	log.Println("Loading configuration...")
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsRegion))
 	if err != nil {
 		log.Fatalf("failed to load configuration, %v", err)
 	}
@@ -139,13 +186,13 @@ func main() {
 		return
 	}
 
-	err = uploadFolder(client, bucketName, "./build", "")
+	err = uploadFolder(client, bucketName, folderPath, "")
 	if err != nil {
 		err = fmt.Errorf("Failed to upload folder: %w", err)
 		return
 	}
 
-	log.Printf("Site available at: http://%s.s3-website-us-east-1.amazonaws.com\n", bucketName)
+	log.Printf("Site available at: http://%s.s3-website-%s.amazonaws.com\n", bucketName, awsRegion)
 
 	cfClient := cloudfront.NewFromConfig(cfg)
 
@@ -153,8 +200,8 @@ func main() {
 		ctx,
 		cfClient,
 		bucketName,
-		"myblog.lawangin.io.s3-website-us-east-1.amazonaws.com",
-		"arn:aws:acm:us-east-1:992293952919:certificate/1410daa8-1d0f-4369-bd97-f33db72d531d",
+		fmt.Sprintf("%s.s3-website-%s.amazonaws.com", bucketName, awsRegion),
+		sslCertARN,
 	)
 	if err != nil {
 		err = fmt.Errorf("Failed to create CloudFront Domain: %w", err)
@@ -183,7 +230,8 @@ func main() {
 		ctx,
 		r53Client,
 		zoneID, // ← Replace with your actual hosted zone ID for lawangin.io
-		"myblog",
+		projectName,
+		domain,
 		cfDomain, // ← Replace with your real CloudFront domain
 	)
 	if err != nil {
@@ -309,6 +357,7 @@ func createSubdomainAliasRecord(
 	r53Client *route53.Client,
 	hostedZoneID string,
 	subdomain string,
+	domain string,
 	cloudfrontDomain string,
 ) error {
 
@@ -320,7 +369,7 @@ func createSubdomainAliasRecord(
 				{
 					Action: r53types.ChangeActionUpsert,
 					ResourceRecordSet: &r53types.ResourceRecordSet{
-						Name: aws.String(subdomain + ".lawangin.io."),
+						Name: aws.String(subdomain + domain + "."),
 						Type: r53types.RRTypeA,
 						AliasTarget: &r53types.AliasTarget{
 							DNSName:              aws.String(cloudfrontDomain + "."), // must end in dot
@@ -340,7 +389,7 @@ func createSubdomainAliasRecord(
 		return fmt.Errorf("failed to create alias record: %w", err)
 	}
 
-	log.Printf("Subdomain record created for %s.lawangin.io\n", subdomain)
+	log.Printf("Subdomain record created for %s.%s\n", subdomain, domain)
 	return nil
 }
 
@@ -409,4 +458,18 @@ func deleteCloudFrontDistribution(ctx context.Context, cfClient *cloudfront.Clie
 	})
 
 	log.Println("CloudFront distribution deleted.")
+}
+
+func folderSize(path string) (int64, error) {
+	var total int64 = 0
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
 }
