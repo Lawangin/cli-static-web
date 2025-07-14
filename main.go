@@ -28,6 +28,10 @@ func main() {
 	bucketName := "myblog.lawangin.io"
 	ctx := context.TODO()
 
+	s3Created := false
+	cfCreated := false
+	var cfDistID string
+
 	// Load the Shared AWS Configuration (~/.aws/config)
 	log.Println("Loading configuration...")
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
@@ -38,6 +42,20 @@ func main() {
 	// Create an Amazon S3 service client
 	log.Println("Creating s3 client...")
 	client := s3.NewFromConfig(cfg)
+
+	defer func() {
+		if err != nil {
+			log.Println("Error occurred, starting rollback...")
+			if cfCreated {
+				cfClient := cloudfront.NewFromConfig(cfg)
+				deleteCloudFrontDistribution(ctx, cfClient, cfDistID)
+			}
+			if s3Created {
+				deleteS3Bucket(ctx, client, bucketName)
+			}
+			log.Fatalf("Deployment failed: %v", err)
+		}
+	}()
 
 	// Get the first page of results for ListObjectsV2 for a bucket
 	bucketsList, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
@@ -59,10 +77,11 @@ func main() {
 			Bucket: aws.String(bucketName),
 		})
 		if err != nil {
-			log.Fatal("Bucket creation failed:", err)
+			err = fmt.Errorf("Bucket creation failed: %w", err)
+			return
 		}
 		log.Println("Bucket created:", bucketName)
-
+		s3Created = true
 	} else {
 		log.Println("Bucket already exists:", bucketName)
 	}
@@ -76,7 +95,8 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatal("Failed to enable static website:", err)
+		err = fmt.Errorf("Failed to enable static website: %w", err)
+		return
 	}
 
 	// remove blocked access to bucket
@@ -90,7 +110,7 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatal("Failed to enable public policy:", err)
+		err = fmt.Errorf("Failed to enable public policy: %w", err)
 	}
 
 	// define bucket policy
@@ -115,19 +135,21 @@ func main() {
 		Policy: aws.String(string(policyJson)),
 	})
 	if err != nil {
-		log.Fatal("Failed to enable bucket policy:", err)
+		err = fmt.Errorf("Failed to enable bucket policy: %w", err)
+		return
 	}
 
 	err = uploadFolder(client, bucketName, "./build", "")
 	if err != nil {
-		log.Fatalf("Failed to upload folder: %v", err)
+		err = fmt.Errorf("Failed to upload folder: %w", err)
+		return
 	}
 
 	log.Printf("Site available at: http://%s.s3-website-us-east-1.amazonaws.com\n", bucketName)
 
 	cfClient := cloudfront.NewFromConfig(cfg)
 
-	cfDomain, err := createCloudFrontDistribution(
+	cfDomain, distID, err := createCloudFrontDistribution(
 		ctx,
 		cfClient,
 		bucketName,
@@ -135,16 +157,25 @@ func main() {
 		"arn:aws:acm:us-east-1:992293952919:certificate/1410daa8-1d0f-4369-bd97-f33db72d531d",
 	)
 	if err != nil {
-		log.Fatalf("Failed to create CloudFront Domain: %v", err)
+		err = fmt.Errorf("Failed to create CloudFront Domain: %w", err)
+		return
 	}
-
 	log.Printf("CloudFront Domain created at: %s", cfDomain)
+	cfCreated = true
+	cfDistID = distID
+
+	// if we want to simulate an error to trigger cleanup
+	//if true {
+	//	err = fmt.Errorf("simulated post-CF creation failure")
+	//	return
+	//}
 
 	r53Client := route53.NewFromConfig(cfg)
 
 	zoneID, err := getHostedZoneIDByName(ctx, r53Client, "lawangin.io")
 	if err != nil {
-		log.Fatalf("Unable to get hosted zone ID: %v", err)
+		err = fmt.Errorf("Unable to get hosted zone ID: %w", err)
+		return
 	}
 	log.Printf("Found hosted zone ID: %s", zoneID)
 
@@ -156,7 +187,8 @@ func main() {
 		cfDomain, // ← Replace with your real CloudFront domain
 	)
 	if err != nil {
-		log.Fatalf("Route 53 record creation failed: %v", err)
+		err = fmt.Errorf("Route 53 record creation failed: %w", err)
+		return
 	}
 	log.Println("Route 53 record successfully created")
 
@@ -210,7 +242,7 @@ func createCloudFrontDistribution(
 	subdomain string,
 	s3WebsiteEndpoint string,
 	sslCertARN string,
-) (string, error) {
+) (domain string, distID string, err error) {
 
 	input := &cloudfront.CreateDistributionInput{
 		DistributionConfig: &cftypes.DistributionConfig{
@@ -266,10 +298,10 @@ func createCloudFrontDistribution(
 
 	output, err := cfClient.CreateDistribution(ctx, input)
 	if err != nil {
-		return "", fmt.Errorf("failed to create CloudFront distribution: %w", err)
+		return "", "", fmt.Errorf("failed to create CloudFront distribution: %w", err)
 	}
 
-	return aws.ToString(output.Distribution.DomainName), nil
+	return aws.ToString(output.Distribution.DomainName), aws.ToString(output.Distribution.Id), nil
 }
 
 func createSubdomainAliasRecord(
@@ -334,4 +366,47 @@ func getHostedZoneIDByName(ctx context.Context, r53Client *route53.Client, domai
 	}
 
 	return "", fmt.Errorf("hosted zone for domain %s not found", domainName)
+}
+
+func deleteS3Bucket(ctx context.Context, s3Client *s3.Client, bucketName string) {
+	log.Println("Rolling back: deleting S3 bucket:", bucketName)
+
+	// Delete all objects first (required)
+	objList, _ := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucketName)})
+	for _, obj := range objList.Contents {
+		_, _ = s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    obj.Key,
+		})
+	}
+	_, _ = s3Client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucketName)})
+	log.Println("S3 bucket deleted.")
+}
+
+func deleteCloudFrontDistribution(ctx context.Context, cfClient *cloudfront.Client, distID string) {
+	log.Println("Rolling back: deleting CloudFront distribution:", distID)
+
+	// First disable the distribution
+	getOut, _ := cfClient.GetDistributionConfig(ctx, &cloudfront.GetDistributionConfigInput{
+		Id: aws.String(distID),
+	})
+
+	getOut.DistributionConfig.Enabled = aws.Bool(false)
+
+	_, _ = cfClient.UpdateDistribution(ctx, &cloudfront.UpdateDistributionInput{
+		Id:                 aws.String(distID),
+		IfMatch:            aws.String(*getOut.ETag),
+		DistributionConfig: getOut.DistributionConfig,
+	})
+
+	// Wait a few seconds to allow disable to propagate (CloudFront takes time)
+	time.Sleep(20 * time.Second)
+
+	// Then delete
+	_, _ = cfClient.DeleteDistribution(ctx, &cloudfront.DeleteDistributionInput{
+		Id:      aws.String(distID),
+		IfMatch: aws.String(*getOut.ETag),
+	})
+
+	log.Println("CloudFront distribution deleted.")
 }
